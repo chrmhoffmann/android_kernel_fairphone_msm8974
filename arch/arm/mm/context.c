@@ -26,20 +26,35 @@ DEFINE_PER_CPU(struct mm_struct *, current_mm);
 #endif
 
 #ifdef CONFIG_ARM_LPAE
-#define cpu_set_asid(asid) {						\
-	unsigned long ttbl, ttbh;					\
-	asm volatile(							\
-	"	mrrc	p15, 0, %0, %1, c2		@ read TTBR0\n"	\
-	"	mov	%1, %2, lsl #(48 - 32)		@ set ASID\n"	\
-	"	mcrr	p15, 0, %0, %1, c2		@ set TTBR0\n"	\
-	: "=&r" (ttbl), "=&r" (ttbh)					\
-	: "r" (asid & ~ASID_MASK));					\
+static void cpu_set_reserved_ttbr0(void)
+{
+	unsigned long ttbl = __pa(swapper_pg_dir);
+	unsigned long ttbh = 0;
+
+	/*
+	 * Set TTBR0 to swapper_pg_dir which contains only global entries. The
+	 * ASID is set to 0.
+	 */
+	asm volatile(
+	"	mcrr	p15, 0, %0, %1, c2		@ set TTBR0\n"
+	:
+	: "r" (ttbl), "r" (ttbh));
+	isb();
 }
 #else
-#define cpu_set_asid(asid) \
-	asm("	mcr	p15, 0, %0, c13, c0, 1\n" : : "r" (asid))
+static void cpu_set_reserved_ttbr0(void)
+{
+	u32 ttb;
+	/* Copy TTBR1 into TTBR0 */
+	asm volatile(
+	"	mrc	p15, 0, %0, c2, c0, 1		@ read TTBR1\n"
+	"	mcr	p15, 0, %0, c2, c0, 0		@ set TTBR0\n"
+	: "=r" (ttb));
+	isb();
+}
 #endif
 
+#ifdef CONFIG_PID_IN_CONTEXTIDR
 static void write_contextidr(u32 contextidr)
 {
 	uncached_logk(LOGK_CTXID, (void *)contextidr);
@@ -47,7 +62,6 @@ static void write_contextidr(u32 contextidr)
 	isb();
 }
 
-#ifdef CONFIG_PID_IN_CONTEXTIDR
 static u32 read_contextidr(void)
 {
 	u32 contextidr;
@@ -86,27 +100,12 @@ static int __init contextidr_notifier_init(void)
 	return thread_register_notifier(&contextidr_notifier_block);
 }
 arch_initcall(contextidr_notifier_init);
-
-static void set_asid(unsigned int asid)
-{
-	u32 contextidr = read_contextidr();
-	contextidr &= ASID_MASK;
-	contextidr |= asid & ~ASID_MASK;
-	write_contextidr(contextidr);
-}
-#else
-static void set_asid(unsigned int asid)
-{
-	write_contextidr(asid);
-}
 #endif
 
 /*
  * We fork()ed a process, and we need a new context for the child
- * to run in.  We reserve version 0 for initial tasks so we will
- * always allocate an ASID. The ASID 0 is reserved for the TTBR
- * register changing sequence.
- */
+ * to run in.
+  */
 void __init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 {
 	mm->context.id = 0;
@@ -115,8 +114,7 @@ void __init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 
 static void flush_context(void)
 {
-	/* set the reserved ASID before flushing the TLB */
-	set_asid(0);
+	cpu_set_reserved_ttbr0();
 	local_flush_tlb_all();
 	if (icache_is_vivt_asid_tagged()) {
 		__flush_icache_all();
@@ -177,7 +175,7 @@ static void reset_context(void *info)
 	set_mm_context(mm, asid);
 
 	/* set the new ASID */
-	set_asid(mm->context.id);
+	cpu_switch_mm(mm->pgd, mm);
 }
 
 #else
